@@ -72,9 +72,11 @@ if not torch.cuda.is_available():
         'export TORCH_CUDA_ARCH_LIST="compute capability" before running setup.py.\n',
     )
     if os.environ.get("TORCH_CUDA_ARCH_LIST", None) is None:
-        _, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
+        _, bare_metal_major, bare_metal_minor = get_cuda_bare_metal_version(CUDA_HOME)
         if int(bare_metal_major) == 11:
-            os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5;8.0;8.6"
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5;8.0"
+            if int(bare_metal_minor) > 0:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5;8.0;8.6"
         else:
             os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5"
 
@@ -295,6 +297,58 @@ if "--cuda_ext" in sys.argv:
         )
     )
 
+    # Check, if CUDA11 is installed for compute capability 8.0
+    _, bare_metal_major, bare_metal_minor = get_cuda_bare_metal_version(CUDA_HOME)
+    if int(bare_metal_major) >= 11:
+        cc_flag = []
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_80,code=sm_80")
+        if int(bare_metal_minor) > 0:
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_86,code=sm_86")
+        ext_modules.append(
+            CUDAExtension(
+                name="fused_weight_gradient_mlp_cuda",
+                include_dirs=[os.path.join(this_dir, "csrc")],
+                sources=[
+                    "csrc/megatron/fused_weight_gradient_dense.cpp",
+                    "csrc/megatron/fused_weight_gradient_dense_cuda.cu",
+                    "csrc/megatron/fused_weight_gradient_dense_16bit_prec_cuda.cu",
+                ],
+                extra_compile_args={
+                    "cxx": ["-O3"] + version_dependent_macros,
+                    "nvcc": append_nvcc_threads(
+                        [
+                            "-O3",
+                            "-gencode",
+                            "arch=compute_70,code=sm_70",
+                            "-U__CUDA_NO_HALF_OPERATORS__",
+                            "-U__CUDA_NO_HALF_CONVERSIONS__",
+                            "--expt-relaxed-constexpr",
+                            "--expt-extended-lambda",
+                            "--use_fast_math",
+                        ]
+                        + version_dependent_macros
+                        + cc_flag
+                    ),
+                },
+            )
+        )
+
+if "--permutation_search" in sys.argv:
+    sys.argv.remove("--permutation_search")
+
+    if CUDA_HOME is None:
+        raise RuntimeError("--permutation_search was requested, but nvcc was not found.  Are you sure your environment has nvcc available?  If you're installing within a container from https://hub.docker.com/r/pytorch/pytorch, only images whose names contain 'devel' will provide nvcc.")
+    else:
+        cc_flag = ['-Xcompiler', '-fPIC', '-shared']
+        ext_modules.append(
+            CUDAExtension(name='permutation_search_cuda',
+                          sources=['apex/contrib/sparsity/permutation_search_kernels/CUDA_kernels/permutation_search_kernels.cu'],
+                          include_dirs=[os.path.join(this_dir, 'apex', 'contrib', 'sparsity', 'permutation_search_kernels', 'CUDA_kernels')],
+                          extra_compile_args={'cxx': ['-O3'] + version_dependent_macros,
+                                              'nvcc':['-O3'] + version_dependent_macros + cc_flag}))
+
 if "--bnp" in sys.argv:
     sys.argv.remove("--bnp")
     raise_if_cuda_home_none("--bnp")
@@ -334,6 +388,24 @@ if "--xentropy" in sys.argv:
             extra_compile_args={
                 "cxx": ["-O3"] + version_dependent_macros,
                 "nvcc": append_nvcc_threads(["-O3"] + version_dependent_macros),
+            },
+        )
+    )
+
+if "--focal_loss" in sys.argv:
+    sys.argv.remove("--focal_loss")
+    raise_if_cuda_home_none("--focal_loss")
+    ext_modules.append(
+        CUDAExtension(
+            name='focal_loss_cuda',
+            sources=[
+                'apex/contrib/csrc/focal_loss/focal_loss_cuda.cpp',
+                'apex/contrib/csrc/focal_loss/focal_loss_cuda_kernel.cu',
+            ],
+            include_dirs=[os.path.join(this_dir, 'csrc')],
+            extra_compile_args={
+                'cxx': ['-O3'] + version_dependent_macros,
+                'nvcc':['-O3', '--use_fast_math', '--ftz=false'] + version_dependent_macros,
             },
         )
     )
@@ -483,12 +555,13 @@ if "--fast_multihead_attn" in sys.argv:
 
     # Check, if CUDA11 is installed for compute capability 8.0
     cc_flag = []
-    _, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
+    _, bare_metal_major, bare_metal_minor = get_cuda_bare_metal_version(CUDA_HOME)
     if int(bare_metal_major) >= 11:
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_80,code=sm_80")
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_86,code=sm_86")
+        if int(bare_metal_minor) > 0:
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_86,code=sm_86")
 
     subprocess.run(["git", "submodule", "update", "--init", "apex/contrib/csrc/multihead_attn/cutlass"])
     ext_modules.append(
@@ -567,6 +640,20 @@ if "--fast_bottleneck" in sys.argv:
         CUDAExtension(
             name="fast_bottleneck",
             sources=["apex/contrib/csrc/bottleneck/bottleneck.cpp"],
+            include_dirs=[os.path.join(this_dir, "apex/contrib/csrc/cudnn-frontend/include")],
+            extra_compile_args={"cxx": ["-O3"] + version_dependent_macros + generator_flag},
+        )
+    )
+
+
+if "--fused_conv_bias_relu" in sys.argv:
+    sys.argv.remove("--fused_conv_bias_relu")
+    raise_if_cuda_home_none("--fused_conv_bias_relu")
+    subprocess.run(["git", "submodule", "update", "--init", "apex/contrib/csrc/cudnn-frontend/"])
+    ext_modules.append(
+        CUDAExtension(
+            name="fused_conv_bias_relu",
+            sources=["apex/contrib/csrc/conv_bias_relu/conv_bias_relu.cpp"],
             include_dirs=[os.path.join(this_dir, "apex/contrib/csrc/cudnn-frontend/include")],
             extra_compile_args={"cxx": ["-O3"] + version_dependent_macros + generator_flag},
         )
