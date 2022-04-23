@@ -58,6 +58,18 @@ def append_nvcc_threads(nvcc_extra_args):
     return nvcc_extra_args
 
 
+def check_cudnn_version_and_warn(global_option: str, required_cudnn_version: int) -> bool:
+    cudnn_available = torch.backends.cudnn.is_available()
+    cudnn_version = torch.backends.cudnn.version() if cudnn_available else None
+    if not (cudnn_available and (cudnn_version >= required_cudnn_version)):
+        warnings.warn(
+            f"Skip `{global_option}` as it requires cuDNN {required_cudnn_version} or later, "
+            f"but {'cuDNN is not available' if not cudnn_available else cudnn_version}"
+        )
+        return False
+    return True
+
+
 if not torch.cuda.is_available():
     # https://github.com/NVIDIA/apex/issues/486
     # Extension builds after https://github.com/pytorch/pytorch/pull/23408 attempt to query torch.cuda.get_device_capability(),
@@ -632,15 +644,45 @@ if "--transducer" in sys.argv:
         )
     )
 
+# note (mkozuki): Now `--fast_bottleneck` option (i.e. apex/contrib/bottleneck) depends on `--peer_memory` and `--nccl_p2p`.
 if "--fast_bottleneck" in sys.argv:
     sys.argv.remove("--fast_bottleneck")
     raise_if_cuda_home_none("--fast_bottleneck")
-    subprocess.run(["git", "submodule", "update", "--init", "apex/contrib/csrc/cudnn-frontend/"])
+    if check_cudnn_version_and_warn("--fast_bottleneck", 8400):
+        subprocess.run(["git", "submodule", "update", "--init", "apex/contrib/csrc/cudnn-frontend/"])
+        ext_modules.append(
+            CUDAExtension(
+                name="fast_bottleneck",
+                sources=["apex/contrib/csrc/bottleneck/bottleneck.cpp"],
+                include_dirs=[os.path.join(this_dir, "apex/contrib/csrc/cudnn-frontend/include")],
+                extra_compile_args={"cxx": ["-O3"] + version_dependent_macros + generator_flag},
+            )
+        )
+
+if "--peer_memory" in sys.argv:
+    sys.argv.remove("--peer_memory")
+    raise_if_cuda_home_none("--peer_memory")
     ext_modules.append(
         CUDAExtension(
-            name="fast_bottleneck",
-            sources=["apex/contrib/csrc/bottleneck/bottleneck.cpp"],
-            include_dirs=[os.path.join(this_dir, "apex/contrib/csrc/cudnn-frontend/include")],
+            name="peer_memory_cuda",
+            sources=[
+                "apex/contrib/csrc/peer_memory/peer_memory_cuda.cu",
+                "apex/contrib/csrc/peer_memory/peer_memory.cpp",
+            ],
+            extra_compile_args={"cxx": ["-O3"] + version_dependent_macros + generator_flag},
+        )
+    )
+
+if "--nccl_p2p" in sys.argv:
+    sys.argv.remove("--nccl_p2p")
+    raise_if_cuda_home_none("--nccl_p2p")
+    ext_modules.append(
+        CUDAExtension(
+            name="nccl_p2p_cuda",
+            sources=[
+                "apex/contrib/csrc/nccl_p2p/nccl_p2p_cuda.cu",
+                "apex/contrib/csrc/nccl_p2p/nccl_p2p.cpp",
+            ],
             extra_compile_args={"cxx": ["-O3"] + version_dependent_macros + generator_flag},
         )
     )
@@ -649,15 +691,16 @@ if "--fast_bottleneck" in sys.argv:
 if "--fused_conv_bias_relu" in sys.argv:
     sys.argv.remove("--fused_conv_bias_relu")
     raise_if_cuda_home_none("--fused_conv_bias_relu")
-    subprocess.run(["git", "submodule", "update", "--init", "apex/contrib/csrc/cudnn-frontend/"])
-    ext_modules.append(
-        CUDAExtension(
-            name="fused_conv_bias_relu",
-            sources=["apex/contrib/csrc/conv_bias_relu/conv_bias_relu.cpp"],
-            include_dirs=[os.path.join(this_dir, "apex/contrib/csrc/cudnn-frontend/include")],
-            extra_compile_args={"cxx": ["-O3"] + version_dependent_macros + generator_flag},
+    if check_cudnn_version_and_warn("--fused_conv_bias_relu", 8400):
+        subprocess.run(["git", "submodule", "update", "--init", "apex/contrib/csrc/cudnn-frontend/"])
+        ext_modules.append(
+            CUDAExtension(
+                name="fused_conv_bias_relu",
+                sources=["apex/contrib/csrc/conv_bias_relu/conv_bias_relu.cpp"],
+                include_dirs=[os.path.join(this_dir, "apex/contrib/csrc/cudnn-frontend/include")],
+                extra_compile_args={"cxx": ["-O3"] + version_dependent_macros + generator_flag},
+            )
         )
-    )
 
 
 setup(
