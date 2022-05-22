@@ -1,8 +1,16 @@
 import random
 import torch
+try:
+    import torch_ucc
+except ImportError:
+    HAS_TORCH_UCC = False
+else:
+    HAS_TORCH_UCC = True
+    print("Use UCC as backend of Pipeline Parallel ProcessGroups")
 
 from apex.transformer import tensor_parallel
 from apex.transformer import parallel_state
+from apex.transformer.log_util import set_logging_level
 from apex.transformer.tensor_parallel import vocab_parallel_cross_entropy
 from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator
 from apex.transformer.pipeline_parallel.utils import (
@@ -27,6 +35,7 @@ class DebugWarning(Warning):
     pass
 
 
+set_logging_level("WARNING")
 mode = None
 MANUAL_SEED = 42
 inds = None
@@ -116,7 +125,7 @@ def fwd_step_func(batch, model):
         lm_loss = torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
         averaged_loss = average_losses_across_data_parallel_group([lm_loss])
         if data_idx >= 1536:
-            assert lm_loss < 4.8
+            assert averaged_loss < 4.8
             if not ONCE:
                 print("LOSS OK")
                 ONCE = True
@@ -126,7 +135,7 @@ def fwd_step_func(batch, model):
 
 
 def train(
-    model, optim, virtual_pipeline_model_parallel_size, pipeline_model_parallel_size
+    model, optim, virtual_pipeline_model_parallel_size, pipeline_model_parallel_size, async_comm
 ):
     sequence_len = global_vars.get_args().seq_length
     micro_batch_size = global_vars.get_args().micro_batch_size
@@ -139,7 +148,7 @@ def train(
         batch = generate_fancy_data_labels(sequence_len, batch_size)
         optim.zero_grad()
         forward_backward_func(
-            fwd_step_func, batch, model, forward_only=False, tensor_shape=tensor_shape
+            fwd_step_func, batch, model, forward_only=False, tensor_shape=tensor_shape, async_comm=async_comm,
         )
         optim.step()
 
@@ -154,54 +163,65 @@ if __name__ == "__main__":
     effective_length = fancy_data.size(0) // global_vars.get_args().seq_length
     effective_length = fancy_data.size(0) - global_vars.get_args().seq_length
 
-    initialize_distributed()
+    initialize_distributed("nccl")
     world_size = torch.distributed.get_world_size()
     failure = None
+    init = True
     try:
-        args = global_vars.get_args()
-        args.padded_vocab_size = 128  # needed in standalone gpt
-        batch_size = args.global_batch_size
-        micro_batch_size = args.micro_batch_size
-        setup_microbatch_calculator(
-            args.rank,
-            args.rampup_batch_size,
-            args.global_batch_size,
-            args.micro_batch_size,
-            args.data_parallel_size,
-        )
-        virtual_pipeline_model_parallel_size = 2
-        pipeline_model_parallel_size = world_size
-        parallel_state.initialize_model_parallel(
-            args.tensor_model_parallel_size,
-            args.pipeline_model_parallel_size,
-            virtual_pipeline_model_parallel_size,
-        )
-        pipeline_model_parallel_size = (
-            parallel_state.get_pipeline_model_parallel_world_size()
-        )
-        tensor_parallel.random.model_parallel_cuda_manual_seed(0)
-        model = build_model(
-            bert_model_provider,
-            wrap_with_ddp=True,
-            virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
-            cpu_offload=args.cpu_offload,
-        )
-        assert isinstance(model, list)
-        assert len(model) == (
-            1
-            if virtual_pipeline_model_parallel_size is None
-            else virtual_pipeline_model_parallel_size
-        )
-        _param_groups = _get_params_for_weight_decay_optimization(model)
-        optim = torch.optim.Adam(_param_groups)
-        print(effective_length)
-        print(fancy_data.size(0))
-        train(
-            model,
-            optim,
-            virtual_pipeline_model_parallel_size,
-            args.pipeline_model_parallel_size,
-        )
+        for virtual_pipeline_model_parallel_size in (2, None):
+            async_comm = virtual_pipeline_model_parallel_size is None
+            data_idx = 0
+            ONCE = False
+            if init:
+                init = False
+                args = global_vars.get_args()
+                args.padded_vocab_size = 128  # needed in standalone gpt
+                batch_size = args.global_batch_size
+                micro_batch_size = args.micro_batch_size
+                setup_microbatch_calculator(
+                    args.rank,
+                    args.rampup_batch_size,
+                    args.global_batch_size,
+                    args.micro_batch_size,
+                    args.data_parallel_size,
+                )
+            else:
+               parallel_state.destroy_model_parallel()
+            parallel_state.initialize_model_parallel(
+                args.tensor_model_parallel_size,
+                args.pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size,
+                default_backend="nccl",
+                p2p_backend="ucc" if HAS_TORCH_UCC else "nccl",
+            )
+            pipeline_model_parallel_size = (
+                parallel_state.get_pipeline_model_parallel_world_size()
+            )
+
+            tensor_parallel.random.model_parallel_cuda_manual_seed(0)
+            model = build_model(
+                bert_model_provider,
+                wrap_with_ddp=True,
+                virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+                cpu_offload=args.cpu_offload,
+            )
+            assert isinstance(model, list)
+            assert len(model) == (
+                1
+                if virtual_pipeline_model_parallel_size is None
+                else virtual_pipeline_model_parallel_size
+            )
+            _param_groups = _get_params_for_weight_decay_optimization(model)
+            optim = torch.optim.Adam(_param_groups)
+            print(effective_length)
+            print(fancy_data.size(0))
+            train(
+                model,
+                optim,
+                virtual_pipeline_model_parallel_size,
+                args.pipeline_model_parallel_size,
+                async_comm,
+            )
     except Exception as e:
         failure = str(e)
     finally:
